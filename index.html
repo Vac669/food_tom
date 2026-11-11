@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#F3F5F2">
+  <meta name="description" content="Zdjęcie posiłku zamienione na składniki, makro i kalorie. Dziennik z sumą dzienną.">
+  <title>Tom Food</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div id="app"></div>
+
+  <!-- Dwa ukryte pola: pierwsze otwiera aparat, drugie galerię. -->
+  <input type="file" id="pick-camera" accept="image/*" capture="environment" hidden>
+  <input type="file" id="pick-gallery" accept="image/*" hidden>
+
+  <noscript>Tom Food potrzebuje włączonego JavaScriptu.</noscript>
+
+  <script src="js/calc.js"></script>
+  <script src="js/ai.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
