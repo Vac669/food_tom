@@ -5,6 +5,7 @@
   const { num } = TF.calc;
 
   const TIMEOUT_MS = 120000;
+  const MAX_OUTPUT_TOKENS = 8000;
 
   const DEFAULT_MODELS = {
     gemini: 'gemini-3.7-flash',
@@ -139,7 +140,7 @@
     return { mime: m[1], base64: m[2] };
   }
 
-  async function request(url, init) {
+  async function request(url, init, providerLabel) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
     let res;
@@ -147,9 +148,15 @@
       res = await fetch(url, { ...init, signal: ctrl.signal });
     } catch (e) {
       if (e && e.name === 'AbortError') {
-        throw new AiError('Model nie odpowiedział w ciągu 2 minut. Spróbuj ponownie.', { code: 'timeout' });
+        throw new AiError(`${providerLabel} nie odpowiedział w ciągu 2 minut. Spróbuj ponownie albo wybierz szybszy model w ustawieniach.`, {
+          code: 'timeout',
+        });
       }
-      throw new AiError('Brak połączenia z modelem. Sprawdź internet i spróbuj ponownie.', { code: 'network' });
+      // Przeglądarka nie podaje powodu. OpenAI przy błędnym kluczu też kończy się w ten sposób.
+      throw new AiError(
+        `Nie udało się połączyć z ${providerLabel}. Sprawdź internet. Jeśli działa, sprawdź klucz API w ustawieniach.`,
+        { code: 'network', detail: String((e && e.message) || '') }
+      );
     } finally {
       clearTimeout(timer);
     }
@@ -179,39 +186,61 @@
     return new AiError(msg, { code: 'http_' + status, detail });
   }
 
+  function truncatedError(providerLabel) {
+    return new AiError(`${providerLabel} przerwał odpowiedź przed końcem. Spróbuj ponownie.`, { code: 'truncated' });
+  }
+
+  /**
+   * Wysyła kolejne warianty zapytania, od najbogatszego do najprostszego.
+   * Błąd 400 zwykle znaczy, że model nie zna któregoś parametru, więc próbujemy prostszej wersji.
+   */
+  async function sendVariants(variants, send) {
+    let last;
+    for (const variant of variants) {
+      last = await send(variant);
+      if (last.status !== 400) break;
+      const detail = String((last.body && last.body.error && last.body.error.message) || '');
+      if (/api.?key/i.test(detail)) break; // zły klucz: prostsze warianty nic nie zmienią
+    }
+    return last;
+  }
+
   /* ---------- OpenAI ---------- */
 
-  async function callOpenAI({ apiKey, model, dataUrl, prompt }) {
-    const formats = [
-      { type: 'json_schema', json_schema: { name: 'meal_analysis', strict: true, schema: buildSchema('openai') } },
-      { type: 'json_object' },
-      null,
+  /*
+   * reasoning_effort "low": szacowanie porcji nie wymaga długiego namysłu, a domyślny poziom
+   * potrafi wydłużyć odpowiedź do minut. Limit tokenów chroni przed odpowiedzią bez końca.
+   */
+  function openaiVariants(wantJson) {
+    const schema = { type: 'json_schema', json_schema: { name: 'meal_analysis', strict: true, schema: buildSchema('openai') } };
+    if (!wantJson) return [{ effort: 'low', max: 2000 }, { max: 2000 }, {}];
+    return [
+      { format: schema, effort: 'low', max: MAX_OUTPUT_TOKENS },
+      { format: schema, max: MAX_OUTPUT_TOKENS },
+      { format: { type: 'json_object' }, max: MAX_OUTPUT_TOKENS },
+      {},
     ];
-    let last;
-    for (const format of formats) {
-      const payload = {
-        model,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              { type: 'image_url', image_url: { url: dataUrl } },
-            ],
-          },
-        ],
-      };
-      if (format) payload.response_format = format;
-      last = await request('https://api.openai.com/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + apiKey },
-        body: JSON.stringify(payload),
-      });
-      // 400 może oznaczać, że model nie zna danego formatu odpowiedzi: wtedy prostszy wariant.
-      if (last.status !== 400) break;
-    }
+  }
+
+  async function openaiChat({ apiKey, model, content, wantJson }) {
+    const last = await sendVariants(openaiVariants(wantJson), (v) => {
+      const payload = { model, messages: [{ role: 'user', content }] };
+      if (v.format) payload.response_format = v.format;
+      if (v.effort) payload.reasoning_effort = v.effort;
+      if (v.max) payload.max_completion_tokens = v.max;
+      return request(
+        'https://api.openai.com/v1/chat/completions',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + apiKey },
+          body: JSON.stringify(payload),
+        },
+        'OpenAI'
+      );
+    });
     if (!last.ok) throw httpError('OpenAI', last.status, last.body);
-    const msg = last.body && last.body.choices && last.body.choices[0] && last.body.choices[0].message;
+    const choice = last.body && last.body.choices && last.body.choices[0];
+    const msg = choice && choice.message;
     if (msg && msg.refusal) {
       throw new AiError('Model odmówił analizy tego zdjęcia. Spróbuj z innym ujęciem.', {
         code: 'refusal',
@@ -220,35 +249,42 @@
     }
     let text = msg && msg.content;
     if (Array.isArray(text)) text = text.map((p) => (p && p.text) || '').join('');
-    return extractJson(text);
+    return { text: String(text || ''), truncated: !!choice && choice.finish_reason === 'length' };
   }
 
   /* ---------- Gemini ---------- */
 
-  async function callGemini({ apiKey, model, dataUrl, prompt }) {
-    const { mime, base64 } = splitDataUrl(dataUrl);
-    const configs = [
-      { responseMimeType: 'application/json', responseSchema: buildSchema('gemini') },
-      { responseMimeType: 'application/json' },
-      null,
+  function geminiVariants(wantJson) {
+    if (!wantJson) return [{ thinking: 'low', max: 2000 }, { max: 2000 }, {}];
+    return [
+      { json: true, schema: true, thinking: 'low', max: MAX_OUTPUT_TOKENS },
+      { json: true, schema: true, max: MAX_OUTPUT_TOKENS },
+      { json: true, max: MAX_OUTPUT_TOKENS },
+      {},
     ];
+  }
+
+  async function geminiGenerate({ apiKey, model, parts, wantJson }) {
     const url =
       'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
-    let last;
-    for (const cfg of configs) {
-      const payload = {
-        contents: [{ parts: [{ inline_data: { mime_type: mime, data: base64 } }, { text: prompt }] }],
-      };
-      if (cfg) payload.generationConfig = cfg;
-      last = await request(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
-        body: JSON.stringify(payload),
-      });
-      if (last.status !== 400) break;
-      const detail = String((last.body && last.body.error && last.body.error.message) || '');
-      if (/api.?key/i.test(detail)) break; // zły klucz: kolejne warianty nic nie zmienią
-    }
+    const last = await sendVariants(geminiVariants(wantJson), (v) => {
+      const cfg = {};
+      if (v.json) cfg.responseMimeType = 'application/json';
+      if (v.schema) cfg.responseSchema = buildSchema('gemini');
+      if (v.thinking) cfg.thinkingConfig = { thinkingLevel: v.thinking };
+      if (v.max) cfg.maxOutputTokens = v.max;
+      const payload = { contents: [{ parts }] };
+      if (Object.keys(cfg).length) payload.generationConfig = cfg;
+      return request(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+          body: JSON.stringify(payload),
+        },
+        'Gemini'
+      );
+    });
     if (!last.ok) throw httpError('Gemini', last.status, last.body);
     const body = last.body || {};
     if (body.promptFeedback && body.promptFeedback.blockReason) {
@@ -258,12 +294,30 @@
       });
     }
     const cand = body.candidates && body.candidates[0];
-    const parts = (cand && cand.content && cand.content.parts) || [];
-    const text = parts
+    const text = ((cand && cand.content && cand.content.parts) || [])
       .filter((p) => p && !p.thought && typeof p.text === 'string')
       .map((p) => p.text)
       .join('');
-    return extractJson(text);
+    return { text, truncated: !!cand && cand.finishReason === 'MAX_TOKENS' };
+  }
+
+  /* ---------- Wspólne wejścia ---------- */
+
+  const LABELS = { openai: 'OpenAI', gemini: 'Gemini' };
+
+  function ask({ provider, apiKey, model, text, dataUrl, wantJson }) {
+    if (provider === 'openai') {
+      const content = [{ type: 'text', text }];
+      if (dataUrl) content.push({ type: 'image_url', image_url: { url: dataUrl } });
+      return openaiChat({ apiKey, model, content, wantJson });
+    }
+    const parts = [];
+    if (dataUrl) {
+      const { mime, base64 } = splitDataUrl(dataUrl);
+      parts.push({ inline_data: { mime_type: mime, data: base64 } });
+    }
+    parts.push({ text });
+    return geminiGenerate({ apiKey, model, parts, wantJson });
   }
 
   /**
@@ -274,11 +328,40 @@
     if (!apiKey) {
       throw new AiError('Brakuje klucza API. Dodaj go w ustawieniach.', { code: 'no_key' });
     }
-    const args = { apiKey, model: model || DEFAULT_MODELS[provider], dataUrl, prompt: buildPrompt(weightGrams) };
-    const data = provider === 'openai' ? await callOpenAI(args) : await callGemini(args);
+    const reply = await ask({
+      provider,
+      apiKey,
+      model: model || DEFAULT_MODELS[provider],
+      text: buildPrompt(weightGrams),
+      dataUrl,
+      wantJson: true,
+    });
+    let data;
+    try {
+      data = extractJson(reply.text);
+    } catch (e) {
+      throw reply.truncated ? truncatedError(LABELS[provider]) : e;
+    }
     const result = normalizeResult(data);
     if (num(weightGrams) > 0) result.items = TF.calc.scaleToWeight(result.items, weightGrams);
     return result;
+  }
+
+  /**
+   * Krótki test: jedno zdanie do wybranego modelu, bez zdjęcia.
+   * Pokazuje, czy klucz, model i połączenie działają, i ile trwa odpowiedź.
+   */
+  async function ping({ provider, apiKey, model }) {
+    if (!apiKey) throw new AiError('Najpierw wpisz klucz API.', { code: 'no_key' });
+    const started = Date.now();
+    const reply = await ask({
+      provider,
+      apiKey,
+      model: model || DEFAULT_MODELS[provider],
+      text: 'Odpowiedz jednym słowem: OK',
+      wantJson: false,
+    });
+    return { ms: Date.now() - started, text: reply.text.trim().slice(0, 40) };
   }
 
   /* ---------- Lista modeli ---------- */
@@ -296,17 +379,17 @@
     if (!apiKey) throw new AiError('Najpierw wpisz klucz API.', { code: 'no_key' });
     let ids = [];
     if (provider === 'openai') {
-      const r = await request('https://api.openai.com/v1/models', {
-        headers: { Authorization: 'Bearer ' + apiKey },
-      });
+      const r = await request('https://api.openai.com/v1/models', { headers: { Authorization: 'Bearer ' + apiKey } }, 'OpenAI');
       if (!r.ok) throw httpError('OpenAI', r.status, r.body);
       ids = ((r.body && r.body.data) || [])
         .map((m) => String(m.id || ''))
         .filter((id) => /^(gpt-|o\d|chatgpt-)/.test(id));
     } else {
-      const r = await request('https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000', {
-        headers: { 'x-goog-api-key': apiKey },
-      });
+      const r = await request(
+        'https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000',
+        { headers: { 'x-goog-api-key': apiKey } },
+        'Gemini'
+      );
       if (!r.ok) throw httpError('Gemini', r.status, r.body);
       ids = ((r.body && r.body.models) || [])
         .filter((m) => (m.supportedGenerationMethods || []).includes('generateContent'))
@@ -325,7 +408,9 @@
   TF.ai = {
     AiError,
     DEFAULT_MODELS,
+    LABELS,
     analyzePhoto,
+    ping,
     listModels,
     pickModel,
     // wystawione do testów

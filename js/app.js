@@ -4,6 +4,8 @@
   const TF = window.TF;
   const { calc, ai, db, settings, pin } = TF;
 
+  const APP_VERSION = '2';
+
   const $app = document.getElementById('app');
   const $camera = document.getElementById('pick-camera');
   const $gallery = document.getElementById('pick-gallery');
@@ -522,7 +524,7 @@
     if (!file) return;
     try {
       const { img, url } = await loadImage(file);
-      const full = toJpeg(img, 1280, 0.82); // do modelu
+      const full = toJpeg(img, 1024, 0.8); // do modelu
       const thumb = toJpeg(img, 480, 0.72); // do dziennika
       URL.revokeObjectURL(url);
       const day = state.day;
@@ -594,6 +596,7 @@
         return rerender();
       }
       d.busy = true;
+      d.busySince = Date.now();
       rerender();
       try {
         const r = await ai.analyzePhoto({ ...cfg, dataUrl: d.full, weightGrams: d.weight });
@@ -759,6 +762,16 @@
               : null
           )
         : null;
+      const engine = settings.active();
+      const busyLabel = h('span', {}, 'Analizuję zdjęcie…');
+      if (d.busy) {
+        const tick = () => {
+          const sec = Math.round((Date.now() - d.busySince) / 1000);
+          busyLabel.textContent = `Analizuję zdjęcie… ${sec} s`;
+        };
+        tick();
+        const timer = setInterval(() => (busyLabel.isConnected ? tick() : clearInterval(timer)), 1000);
+      }
       analysis = h(
         'section',
         { class: 'analysis' },
@@ -796,7 +809,15 @@
             'aria-busy': d.busy ? 'true' : null,
             onclick: analyze,
           },
-          d.busy ? [h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Analizuję zdjęcie…'] : d.analyzed ? 'Analizuj ponownie' : 'Analizuj zdjęcie'
+          d.busy ? [h('span', { class: 'spinner', 'aria-hidden': 'true' }), busyLabel] : d.analyzed ? 'Analizuj ponownie' : 'Analizuj zdjęcie'
+        ),
+        h(
+          'p',
+          { class: 'hint hint--engine' },
+          engine.apiKey
+            ? `Analizuje ${ai.LABELS[engine.provider]}, model ${engine.model}. `
+            : `Wybrany dostawca: ${ai.LABELS[engine.provider]}, brak klucza API. `,
+          d.busy ? null : h('a', { href: '#/ustawienia', onclick: () => state.depth++ }, 'Zmień')
         )
       );
     }
@@ -955,6 +976,27 @@
         },
         'Sprawdź klucz i pobierz modele'
       );
+      const testBtn = h(
+        'button',
+        {
+          class: 'btn btn--ghost btn--block',
+          type: 'button',
+          onclick: async () => {
+            testBtn.disabled = true;
+            status.textContent = `Wysyłam krótkie pytanie do modelu ${s[modelField]}…`;
+            try {
+              const r = await ai.ping({ provider: p.id, apiKey: s[keyField], model: s[modelField] });
+              status.textContent = `Model ${s[modelField]} odpowiedział w ${fmt1(r.ms / 1000)} s.`;
+            } catch (err) {
+              const known = err instanceof ai.AiError;
+              status.textContent = (known ? err.message : 'Test się nie powiódł.') + (known && err.detail ? ' Szczegóły: ' + err.detail : '');
+            } finally {
+              testBtn.disabled = false;
+            }
+          },
+        },
+        'Wyślij testowe pytanie do modelu'
+      );
 
       return h(
         'fieldset',
@@ -966,6 +1008,7 @@
         h('label', { class: 'label', for: p.id + '-model' }, 'Model'),
         select,
         fetchBtn,
+        testBtn,
         status
       );
     }
@@ -1081,7 +1124,8 @@
         PROVIDERS.map(providerBlock),
         h('button', { class: 'btn btn--primary btn--block', type: 'submit' }, 'Zapisz ustawienia')
       ),
-      pinGroup
+      pinGroup,
+      h('p', { class: 'hint' }, 'Tom Food, wersja ' + APP_VERSION)
     );
   }
 

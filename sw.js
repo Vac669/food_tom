@@ -3,7 +3,7 @@
  * Zapytania do OpenAI i Gemini idą zawsze prosto do sieci.
  * Po zmianie plików podbij numer wersji, wtedy telefony pobiorą nową wersję.
  */
-const CACHE = 'tomfood-v1';
+const CACHE = 'tomfood-v2';
 const ASSETS = [
   './',
   'index.html',
