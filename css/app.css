@@ -640,6 +640,14 @@ img {
   margin-top: 0;
 }
 
+.result > .section-title:first-child {
+  margin-top: 8px;
+}
+
+.analysis .notice {
+  margin-top: 12px;
+}
+
 .field {
   width: 100%;
   min-height: 52px;

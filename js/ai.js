@@ -6,9 +6,10 @@
 
   const TIMEOUT_MS = 120000;
   const MAX_OUTPUT_TOKENS = 8000;
+  const RETRY_DELAYS_MS = [1200, 3000];
 
   const DEFAULT_MODELS = {
-    gemini: 'gemini-3.7-flash',
+    gemini: 'gemini-flash-latest',
     openai: 'gpt-5.5',
   };
 
@@ -22,8 +23,19 @@
     }
   }
 
-  function buildPrompt(weightGrams) {
+  function cleanTitle(title) {
+    return String(title || '').replace(/["«»\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  }
+
+  function buildPrompt(weightGrams, title) {
     const w = Math.round(num(weightGrams));
+    const t = cleanTitle(title);
+    const titleLines = t
+      ? [
+          `Użytkownik podał tytuł posiłku: "${t}". Potraktuj go jako wskazówkę, co jest na zdjęciu i z czego danie się składa, także gdy składnika nie widać (na przykład nadzienie albo tłuszcz). Ilości oceniaj na podstawie zdjęcia. W meal_name wpisz ten tytuł.`,
+          '',
+        ]
+      : [];
     const weightLine =
       w > 0
         ? `Użytkownik zważył jedzenie: łączna waga to ${w} g. Gramatury składników muszą sumować się do ${w} g.`
@@ -41,6 +53,7 @@
       '- note: jedno krótkie zdanie o tym, co było najtrudniejsze do oszacowania, albo pusty tekst.',
       '- Jeśli zdjęcie nie przedstawia jedzenia ani napoju, ustaw is_food na false i zwróć pustą listę items.',
       '',
+      ...titleLines,
       weightLine,
       '',
       'Odpowiedz wyłącznie obiektem JSON w tym kształcie:',
@@ -178,12 +191,25 @@
       msg = `Wybrany model ${providerLabel} nie istnieje. Pobierz listę modeli w ustawieniach i wybierz inny.`;
     } else if (status === 429) {
       msg = `Limit zapytań ${providerLabel} jest wyczerpany albo skończyły się środki na koncie. Spróbuj później lub przełącz model w ustawieniach.`;
+    } else if (status === 503) {
+      msg = `Model ${providerLabel} jest teraz przeciążony (błąd 503). Spróbuj za chwilę albo wybierz inny model w ustawieniach.`;
     } else if (status >= 500) {
-      msg = `Serwer ${providerLabel} ma chwilowy problem. Spróbuj ponownie za chwilę.`;
+      msg = `Serwer ${providerLabel} zwrócił błąd ${status}. Spróbuj za chwilę albo wybierz inny model w ustawieniach.`;
     } else {
       msg = `${providerLabel} odrzucił zapytanie (błąd ${status}).`;
     }
     return new AiError(msg, { code: 'http_' + status, detail });
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Przeciążony serwer (502, 503, 504) zwykle odpowiada po chwili, więc ponawiamy dwa razy. */
+  async function requestWithRetry(url, init, providerLabel) {
+    for (let attempt = 0; ; attempt++) {
+      const res = await request(url, init, providerLabel);
+      if (![502, 503, 504].includes(res.status) || attempt >= RETRY_DELAYS_MS.length) return res;
+      await sleep(RETRY_DELAYS_MS[attempt]);
+    }
   }
 
   function truncatedError(providerLabel) {
@@ -192,13 +218,14 @@
 
   /**
    * Wysyła kolejne warianty zapytania, od najbogatszego do najprostszego.
-   * Błąd 400 zwykle znaczy, że model nie zna któregoś parametru, więc próbujemy prostszej wersji.
+   * Błąd 400 zwykle znaczy, że model nie zna któregoś parametru, a 500 bywa skutkiem
+   * połączenia parametrów, z którym model sobie nie radzi. W obu przypadkach próbujemy prostszej wersji.
    */
   async function sendVariants(variants, send) {
     let last;
     for (const variant of variants) {
       last = await send(variant);
-      if (last.status !== 400) break;
+      if (last.status !== 400 && last.status !== 500) break;
       const detail = String((last.body && last.body.error && last.body.error.message) || '');
       if (/api.?key/i.test(detail)) break; // zły klucz: prostsze warianty nic nie zmienią
     }
@@ -228,7 +255,7 @@
       if (v.format) payload.response_format = v.format;
       if (v.effort) payload.reasoning_effort = v.effort;
       if (v.max) payload.max_completion_tokens = v.max;
-      return request(
+      return requestWithRetry(
         'https://api.openai.com/v1/chat/completions',
         {
           method: 'POST',
@@ -275,7 +302,7 @@
       if (v.max) cfg.maxOutputTokens = v.max;
       const payload = { contents: [{ parts }] };
       if (Object.keys(cfg).length) payload.generationConfig = cfg;
-      return request(
+      return requestWithRetry(
         url,
         {
           method: 'POST',
@@ -322,20 +349,30 @@
 
   /**
    * Analizuje zdjęcie posiłku.
-   * @returns {Promise<{name: string, items: Array, note: string}>}
+   * Gdy wybrany model nie istnieje albo jego serwer zawodzi, próbuje kolejno modeli zapasowych.
+   * @returns {Promise<{name: string, items: Array, note: string, modelUsed: string}>}
    */
-  async function analyzePhoto({ provider, apiKey, model, dataUrl, weightGrams }) {
+  async function analyzePhoto({ provider, apiKey, model, dataUrl, weightGrams, title, fallbackModels }) {
     if (!apiKey) {
       throw new AiError('Brakuje klucza API. Dodaj go w ustawieniach.', { code: 'no_key' });
     }
-    const reply = await ask({
-      provider,
-      apiKey,
-      model: model || DEFAULT_MODELS[provider],
-      text: buildPrompt(weightGrams),
-      dataUrl,
-      wantJson: true,
-    });
+    const text = buildPrompt(weightGrams, title);
+    const candidates = [model || DEFAULT_MODELS[provider], ...(fallbackModels || [])];
+    let reply = null;
+    let modelUsed = '';
+    let firstError = null;
+    for (const candidate of candidates) {
+      try {
+        reply = await ask({ provider, apiKey, model: candidate, text, dataUrl, wantJson: true });
+        modelUsed = candidate;
+        break;
+      } catch (e) {
+        const canSwitch = e instanceof AiError && /^http_(404|5\d\d)$/.test(e.code);
+        if (!canSwitch) throw e;
+        firstError = firstError || e;
+      }
+    }
+    if (!reply) throw firstError;
     let data;
     try {
       data = extractJson(reply.text);
@@ -343,8 +380,23 @@
       throw reply.truncated ? truncatedError(LABELS[provider]) : e;
     }
     const result = normalizeResult(data);
+    // Nazwa w dzienniku to tytuł dokładnie tak, jak wpisał go użytkownik.
+    if (cleanTitle(title)) result.name = String(title).trim().slice(0, 120);
     if (num(weightGrams) > 0) result.items = TF.calc.scaleToWeight(result.items, weightGrams);
+    result.modelUsed = modelUsed;
     return result;
+  }
+
+  /**
+   * Modele, po które warto sięgnąć, gdy wybrany zawiedzie: najpierw inne modele Flash
+   * z pobranej listy, a bez listy aliasy Google wskazujące zawsze na najnowsze wersje.
+   */
+  function fallbackModels(provider, current, knownIds) {
+    if (provider !== 'gemini') return [];
+    const flash = (knownIds || []).filter((id) => /flash/.test(id) && !/preview|exp/.test(id));
+    const ordered = [...flash.filter((id) => !/lite/.test(id)), ...flash.filter((id) => /lite/.test(id))];
+    const pool = ordered.length ? ordered : ['gemini-flash-latest', 'gemini-flash-lite-latest'];
+    return pool.filter((id) => id !== current).slice(0, 2);
   }
 
   /**
@@ -411,6 +463,7 @@
     LABELS,
     analyzePhoto,
     ping,
+    fallbackModels,
     listModels,
     pickModel,
     // wystawione do testów

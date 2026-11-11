@@ -4,7 +4,7 @@
   const TF = window.TF;
   const { calc, ai, db, settings, pin } = TF;
 
-  const APP_VERSION = '2';
+  const APP_VERSION = '3';
 
   const $app = document.getElementById('app');
   const $camera = document.getElementById('pick-camera');
@@ -537,8 +537,10 @@
         thumb,
         weight: '',
         name: '',
+        titleByUser: false,
         items: [],
         note: '',
+        info: '',
         analyzed: false,
         busy: false,
         error: null,
@@ -599,10 +601,18 @@
       d.busySince = Date.now();
       rerender();
       try {
-        const r = await ai.analyzePhoto({ ...cfg, dataUrl: d.full, weightGrams: d.weight });
+        const known = settings.load()[cfg.provider + 'Models'];
+        const r = await ai.analyzePhoto({
+          ...cfg,
+          dataUrl: d.full,
+          weightGrams: d.weight,
+          title: d.titleByUser ? d.name : '',
+          fallbackModels: ai.fallbackModels(cfg.provider, cfg.model, known),
+        });
         d.name = r.name;
         d.items = r.items;
         d.note = r.note;
+        d.info = r.modelUsed && r.modelUsed !== cfg.model ? `Model ${cfg.model} nie odpowiedział, analizę wykonał ${r.modelUsed}.` : '';
         d.analyzed = true;
       } catch (err) {
         d.error =
@@ -757,7 +767,7 @@
             { class: 'form-error', role: 'alert' },
             h('p', {}, d.error.message),
             d.error.detail ? h('p', { class: 'form-error__detail' }, d.error.detail) : null,
-            /^(no_key|http_401|http_403|http_404|http_429)$/.test(d.error.code)
+            /^(no_key|network|http_401|http_403|http_404|http_429|http_5\d\d)$/.test(d.error.code)
               ? h('a', { href: '#/ustawienia', onclick: () => state.depth++ }, 'Otwórz ustawienia')
               : null
           )
@@ -775,6 +785,22 @@
       analysis = h(
         'section',
         { class: 'analysis' },
+        h('label', { class: 'label', for: 'meal-name' }, 'Tytuł posiłku (opcjonalnie)'),
+        h('input', {
+          class: 'field',
+          id: 'meal-name',
+          type: 'text',
+          maxlength: '120',
+          placeholder: 'np. owsianka z bananem i masłem orzechowym',
+          value: d.name,
+          disabled: d.busy,
+          'aria-describedby': 'title-hint',
+          oninput: (e) => {
+            d.name = e.target.value;
+            d.titleByUser = e.target.value.trim() !== '';
+          },
+        }),
+        h('p', { class: 'hint', id: 'title-hint' }, 'Tytuł podpowiada modelowi, co jest na zdjęciu, i zostaje jako nazwa w dzienniku.'),
         h('label', { class: 'label', for: 'weight' }, 'Waga jedzenia w gramach (opcjonalnie)'),
         h(
           'div',
@@ -818,7 +844,8 @@
             ? `Analizuje ${ai.LABELS[engine.provider]}, model ${engine.model}. `
             : `Wybrany dostawca: ${ai.LABELS[engine.provider]}, brak klucza API. `,
           d.busy ? null : h('a', { href: '#/ustawienia', onclick: () => state.depth++ }, 'Zmień')
-        )
+        ),
+        d.info ? h('p', { class: 'notice', role: 'status' }, d.info) : null
       );
     }
 
@@ -829,16 +856,20 @@
       result = h(
         'section',
         { class: 'result' },
-        h('label', { class: 'label', for: 'meal-name' }, 'Nazwa posiłku'),
-        h('input', {
-          class: 'field',
-          id: 'meal-name',
-          type: 'text',
-          value: d.name,
-          oninput: (e) => {
-            d.name = e.target.value;
-          },
-        }),
+        d.full
+          ? null
+          : [
+              h('label', { class: 'label', for: 'meal-name' }, 'Nazwa posiłku'),
+              h('input', {
+                class: 'field',
+                id: 'meal-name',
+                type: 'text',
+                value: d.name,
+                oninput: (e) => {
+                  d.name = e.target.value;
+                },
+              }),
+            ],
         h('h2', { class: 'section-title' }, 'Składniki'),
         d.items.length
           ? h('ul', { class: 'items' }, d.items.map(itemRow))

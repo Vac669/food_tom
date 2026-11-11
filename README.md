@@ -4,7 +4,7 @@ Uproszczony dziennik kalorii: robisz zdjęcie posiłku, model AI rozpoznaje skł
 
 ## Jak to działa
 
-1. Zdjęcie (aparat lub galeria), opcjonalnie waga porcji w gramach.
+1. Zdjęcie (aparat lub galeria), opcjonalnie tytuł posiłku i waga porcji w gramach.
 2. Zdjęcie trafia prosto z telefonu do Gemini albo OpenAI. Model zwraca listę składników: nazwa, gramatura, białko, tłuszcze i węglowodany na 100 g.
 3. Kalorie liczy aplikacja: `4 × białko + 4 × węglowodany + 9 × tłuszcze`.
 4. Składniki i gramatury można poprawić przed zapisem. Posiłki zapisują się w dzienniku z sumą dzienną.
@@ -20,7 +20,7 @@ Przy pierwszym uruchomieniu wejdź w ustawienia (ikona w prawym górnym rogu), w
 
 ## Aktualizacje
 
-Po zmianie plików podbij numer wersji w `sw.js` (`tomfood-v1` → `tomfood-v2`), żeby telefony pobrały nową wersję.
+Po zmianie plików podbij numer wersji w `sw.js` (np. `tomfood-v3` → `tomfood-v4`), żeby telefony pobrały nową wersję.
 
 ## Pliki
 
